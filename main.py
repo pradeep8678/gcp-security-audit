@@ -1,18 +1,16 @@
-# main.py
 import os
 import json
 from datetime import datetime
-from io import BytesIO
-from flask import Flask, send_file, render_template_string, request
+from flask import Flask, render_template_string, send_file
 import google.auth
 from googleapiclient import discovery
-from googleapiclient.errors import HttpError
 from google.cloud import storage
-import pandas as pd
+import io
+from openpyxl import Workbook
 
 app = Flask(__name__)
 
-# HTML dashboard template
+# HTML template with Excel button
 TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -23,22 +21,25 @@ TEMPLATE = """
     body { font-family: Arial, sans-serif; margin: 20px; background: #f7f8fb; color: #111;}
     h1 { color: #1a73e8; }
     .card { background: white; padding: 12px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 12px; }
-    button { padding: 10px 16px; background: #1a73e8; color: white; border: none; border-radius: 6px; cursor: pointer; }
-    button:hover { background: #1669c1; }
   </style>
 </head>
 <body>
-<h1>🔒 GCP Security Audit</h1>
+<h1>🔒 GCP Security Audit Report</h1>
 
-<form method="GET" action="/download">
-  <button type="submit">Run Audit & Download Excel</button>
-</form>
+<p><a href="/download" style="padding:10px 20px;background:#1a73e8;color:#fff;border-radius:5px;text-decoration:none;">Download Excel Report</a></p>
 
-{% if message %}
+{% for item in results %}
 <div class="card">
-  <p>{{ message }}</p>
+  <h3>{{ item.category }}</h3>
+  <div>{{ item.check }}</div>
+  <pre>{{ item.resources|tojson(indent=2) }}</pre>
 </div>
-{% endif %}
+{% endfor %}
+
+<div class="card">
+  <h3>Raw JSON output</h3>
+  <pre>{{ raw|tojson(indent=2) }}</pre>
+</div>
 
 </body>
 </html>
@@ -58,6 +59,7 @@ def mk_result(category, check, resources=None, notes=None):
 # GCP defaults
 credentials, project = google.auth.default()
 PROJECT_ID = os.environ.get("GCP_PROJECT", project)
+RESULT_BUCKET = os.environ.get("RESULT_BUCKET")
 
 def get_service(name, version):
     return discovery.build(name, version, credentials=credentials, cache_discovery=False)
@@ -86,15 +88,8 @@ def check_sql_public_ips():
         for inst in items:
             ips = []
             for ip in inst.get('ipAddresses', []):
-                ips.append({
-                    "ipAddress": ip.get('ipAddress'),
-                    "type": ip.get('type')
-                })
-            public.append({
-                "instance": inst.get('name'),
-                "region": inst.get('region'),
-                "ipAddresses": ips
-            })
+                ips.append({"ipAddress": ip.get('ipAddress'), "type": ip.get('type')})
+            public.append({"instance": inst.get('name'), "region": inst.get('region'), "ipAddresses": ips})
         return mk_result("Cloud SQL", "SQL Instances", public)
     except Exception as e:
         return mk_result("Cloud SQL", "SQL Instances", notes=str(e))
@@ -108,22 +103,14 @@ def check_gke_public_nodes():
         try:
             resp = container.projects().zones().clusters().list(projectId=PROJECT_ID, zone='-').execute()
             clusters = resp.get('clusters', []) or []
-        except HttpError:
-            try:
-                resp = container.projects().locations().clusters().list(parent=f"projects/{PROJECT_ID}/locations/-").execute()
-                clusters = resp.get('clusters', []) or []
-            except Exception:
-                clusters = []
-
+        except Exception:
+            resp = container.projects().locations().clusters().list(parent=f"projects/{PROJECT_ID}/locations/-").execute()
+            clusters = resp.get('clusters', []) or []
         results = []
         for c in clusters:
             endpoint = c.get('endpoint')
             private_config = c.get('privateClusterConfig')
-            results.append({
-                "cluster": c.get('name'),
-                "endpoint": endpoint,
-                "privateClusterConfig": bool(private_config)
-            })
+            results.append({"cluster": c.get('name'), "endpoint": endpoint, "privateClusterConfig": bool(private_config)})
         return mk_result("GKE", "GKE clusters", results)
     except Exception as e:
         return mk_result("GKE", "GKE clusters", notes=str(e))
@@ -165,24 +152,6 @@ def check_service_accounts_with_owner():
     except Exception as e:
         return mk_result("IAM", "Service Accounts with roles/owner", notes=str(e))
 
-def check_vms():
-    from google.cloud import compute_v1
-    try:
-        client = compute_v1.InstancesClient()
-        zones = [z.name for z in compute_v1.ZonesClient().list(project=PROJECT_ID)]
-        results = []
-        for zone in zones:
-            for vm in client.list(project=PROJECT_ID, zone=zone):
-                results.append({
-                    "name": vm.name,
-                    "zone": zone,
-                    "status": vm.status,
-                    "machine_type": vm.machine_type.split('/')[-1]
-                })
-        return mk_result("Compute Engine VM", "VM Instances", results)
-    except Exception as e:
-        return mk_result("Compute Engine VM", "VM Instances", notes=str(e))
-
 # -----------------------
 # Run all checks
 # -----------------------
@@ -191,42 +160,34 @@ def run_all_checks():
         check_sql_public_ips(),
         check_gke_public_nodes(),
         check_buckets_public(),
-        check_service_accounts_with_owner(),
-        check_vms()
+        check_service_accounts_with_owner()
     ]
 
 # -----------------------
 # Flask routes
 # -----------------------
 @app.route('/')
-def index():
-    return render_template_string(TEMPLATE)
+def dashboard():
+    results = run_all_checks()
+    raw = {"project": PROJECT_ID, "run_time": datetime.utcnow().isoformat() + "Z", "results": results}
+    return render_template_string(TEMPLATE, results=results, raw=raw)
 
 @app.route('/download')
 def download_excel():
     results = run_all_checks()
-
-    # Flatten results for Excel
-    rows = []
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "GCP Audit"
+    ws.append(["Category", "Check", "Resource / Details", "Notes"])
     for item in results:
-        for r in item.get("resources", []):
-            row = {"Category": item["category"], "Check": item["check"]}
-            row.update(r)
-            row["Notes"] = item.get("notes", "")
-            rows.append(row)
+        for r in item["resources"]:
+            ws.append([item["category"], item["check"], json.dumps(r), item.get("notes","")])
+    # Save to in-memory file
+    file_stream = io.BytesIO()
+    wb.save(file_stream)
+    file_stream.seek(0)
+    return send_file(file_stream, download_name=f"gcp_audit_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.xlsx", as_attachment=True)
 
-    df = pd.DataFrame(rows)
-    output = BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
-
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    filename = f"audit-{ts}.xlsx"
-
-    return send_file(output, download_name=filename, as_attachment=True)
-
-# -----------------------
-# Run locally
-# -----------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
